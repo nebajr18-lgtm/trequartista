@@ -1,3 +1,4 @@
+
 name: TREQUARTISTA Football News
 
 on:
@@ -35,14 +36,23 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          GROQ_API_KEY_1: ${{ secrets.GROQ_API_KEY_1 }}
+          GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
+          GROQ_API_KEY_3: ${{ secrets.GROQ_API_KEY_3 }}
+          GROQ_API_KEY_4: ${{ secrets.GROQ_API_KEY_4 }}
+          GROQ_API_KEY_5: ${{ secrets.GROQ_API_KEY_5 }}
         run: python main.py
 
       - name: Save article history
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen_articles.json
-          if ! git diff --cached --quiet; then
-            git commit -m "Update published article history"
-            git push origin HEAD:main
+          if [ -f seen_articles.json ]; then
+            git add seen_articles.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update published article history"
+              git push origin HEAD:main
+            fi
+          else
+            echo "No article history file created; nothing to commit."
           fi
