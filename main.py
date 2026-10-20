@@ -146,40 +146,57 @@ def save_history(history):
 # ============================================================
 
 def extract_image(entry):
-    """Find an image URL provided by the RSS entry."""
+    """Find images in RSS metadata and embedded HTML."""
+    from html import unescape
+    from urllib.parse import urljoin
+
     candidates = []
-
-    for item in entry.get("media_content", []) or []:
-        if item.get("url"):
-            candidates.append(item["url"])
-
-    for item in entry.get("media_thumbnail", []) or []:
-        if item.get("url"):
-            candidates.append(item["url"])
-
-    for item in entry.get("enclosures", []) or []:
-        url = item.get("href") or item.get("url")
-        media_type = item.get("type", "")
-
-        if url and media_type.startswith("image/"):
-            candidates.append(url)
+    for field in ("media_content", "media_thumbnail", "enclosures"):
+        for item in entry.get(field, []) or []:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url") or item.get("href")
+            kind = item.get("type", "")
+            if url and (
+                field != "enclosures"
+                or kind.startswith("image/")
+                or re.search(r"\.(jpg|jpeg|png|webp|gif)(?:[?#]|$)", url, re.I)
+            ):
+                candidates.append(url)
 
     image = entry.get("image")
+    if isinstance(image, dict):
+        candidates.extend([image.get("href"), image.get("url")])
 
-    if isinstance(image, dict) and image.get("href"):
-        candidates.append(image["href"])
+    parts = []
+    for item in entry.get("content", []) or []:
+        if isinstance(item, dict):
+            parts.append(item.get("value", ""))
+    for field in ("summary", "description", "summary_detail"):
+        value = entry.get(field, "")
+        if isinstance(value, dict):
+            value = value.get("value", "")
+        if isinstance(value, str):
+            parts.append(value)
 
-    for url in candidates:
-        if (
-            isinstance(url, str)
-            and url.startswith("https://")
-        ):
+    for html_text in parts:
+        for tag in re.findall(r"<img\b[^>]*>", html_text, re.I):
+            for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+                match = re.search(
+                    attr + r"\s*=\s*['\"]([^'\"]+)['\"]", tag, re.I
+                )
+                if match:
+                    candidates.append(match.group(1))
+
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        url = urljoin(entry.get("link", ""), unescape(candidate.strip()))
+        if url.startswith("https://"):
             return url
-
     return None
 
 
-# ============================================================
 # GROQ AI SUMMARIZATION WITH ALL MODEL FALLBACKS
 # ============================================================
 
@@ -251,7 +268,14 @@ Supplied article text:
                             },
                         ],
                         "temperature": 0.2,
-                        "max_tokens": 220,
+                        **(
+                        {
+                            "max_completion_tokens": 1024,
+                            "reasoning_effort": "low",
+                        }
+                        if model.startswith("openai/gpt-oss-")
+                        else {"max_tokens": 220}
+                    ),
                     },
                     timeout=30,
                 )
@@ -345,30 +369,34 @@ def get_date(entry):
 
 
 def collect_articles(seen):
+    """Collect articles while suppressing duplicate URLs and headlines."""
     articles = []
+    seen_titles = set()
+
+    def title_key(title):
+        return " ".join(re.findall(r"\w+", title.casefold()))
 
     for source, feed_url in RSS_FEEDS:
         try:
-            response = session.get(
-                feed_url,
-                timeout=20,
-            )
+            response = session.get(feed_url, timeout=20)
             response.raise_for_status()
-
             feed = feedparser.parse(response.content)
 
             for entry in feed.entries:
                 title = clean_text(entry.get("title", ""))
                 url = normalize_url(entry.get("link", ""))
-
                 description = clean_text(
-                    entry.get("summary", "")
-                    or entry.get("description", "")
+                    entry.get("summary", "") or entry.get("description", "")
                 )
+                key = title_key(title)
 
-                if not title or not url or url in seen:
+                if not title or not url or url in seen or not key:
+                    continue
+                if key in seen_titles:
+                    logging.info("Skipped duplicate headline: %s", title)
                     continue
 
+                seen_titles.add(key)
                 articles.append({
                     "source": source,
                     "title": title,
@@ -377,24 +405,13 @@ def collect_articles(seen):
                     "image": extract_image(entry),
                     "date": get_date(entry),
                 })
-
         except Exception:
-            logging.exception(
-                "Could not collect feed from %s.",
-                source,
-            )
+            logging.exception("Could not collect feed from %s.", source)
 
-    articles.sort(
-        key=lambda article: article["date"],
-        reverse=True,
-    )
-
+    articles.sort(key=lambda article: article["date"], reverse=True)
     return articles
 
 
-# ============================================================
-# TELEGRAM PUBLISHING
-# ============================================================
 
 def telegram_request(method, payload, files=None):
     url = (
