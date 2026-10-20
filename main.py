@@ -1,313 +1,415 @@
 
-"""
-TREQUARTISTA — BETWEEN THE LINES.
-RSS Football News Collector
-"""
-
-import html
-import json
-import logging
 import os
 import re
-import sys
+import json
+import html
 import time
-from datetime import datetime, timezone
+import logging
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlsplit, urlunsplit
 
-import feedparser
 import requests
-
-
-# --------------------------------------------------
-# CONFIGURATION
-# --------------------------------------------------
-
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv(
-    "TELEGRAM_CHANNEL_ID", "@Trequartista_official"
-).strip()
-
-STATE_FILE = Path("seen_articles.json")
-MAX_POSTS_PER_RUN = 3
-MAX_SEEN_ARTICLES = 2000
-REQUEST_TIMEOUT = 20
-
-RSS_FEEDS = {
-    "BBC Sport": "https://feeds.bbci.co.uk/sport/football/rss.xml",
-    "The Guardian": "https://www.theguardian.com/football/rss",
-}
-
-HEADERS = {
-    "User-Agent": "TrequartistaFootballNews/1.0"
-}
+import feedparser
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("trequartista")
+
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHANNEL_ID = os.environ.get(
+    "TELEGRAM_CHANNEL_ID",
+    "@Trequartista_official",
+)
+
+STATE_FILE = Path("seen_articles.json")
+MAX_POSTS_PER_RUN = 3
+MAX_SUMMARY_CHARS = 600
+
+GROQ_MODEL = os.environ.get(
+    "GROQ_MODEL",
+    "openai/gpt-oss-20b",
+)
+
+RSS_FEEDS = [
+    ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml"),
+    ("The Guardian", "https://www.theguardian.com/football/rss"),
+]
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "TREQUARTISTA-FootballNews/1.0"
+})
 
 
-# --------------------------------------------------
-# TEXT AND ARTICLE UTILITIES
-# --------------------------------------------------
+def groq_keys():
+    """Read Groq keys from GitHub Actions secrets."""
+    keys = []
+    for name in [
+        "GROQ_API_KEY",
+        "GROQ_API_KEY_1",
+        "GROQ_API_KEY_2",
+        "GROQ_API_KEY_3",
+        "GROQ_API_KEY_4",
+        "GROQ_API_KEY_5",
+    ]:
+        value = os.environ.get(name, "").strip()
+        if value and value not in keys:
+            keys.append(value)
+    return keys
+
 
 def clean_text(value):
-    """Remove HTML and normalize article text."""
     value = html.unescape(value or "")
     value = re.sub(r"<[^>]+>", " ", value)
     return re.sub(r"\s+", " ", value).strip()
 
 
 def normalize_url(url):
-    """Remove URL fragments and common tracking parameters."""
-    try:
-        parsed = urlparse(url.strip())
-        if parsed.scheme not in ("http", "https"):
-            return ""
-
-        return urlunparse((
-            parsed.scheme,
-            parsed.netloc.lower(),
-            parsed.path.rstrip("/"),
-            "",
-            "",
-            "",
-        ))
-    except (ValueError, AttributeError):
-        return ""
+    """Keep the URL for internal duplicate tracking only."""
+    parts = urlsplit(url or "")
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        "",
+        "",
+    ))
 
 
-def load_seen_articles():
-    """Load previously processed article links."""
+def load_history():
     if not STATE_FILE.exists():
         return []
 
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, list):
-            return [
-                str(item) for item in data
-                if isinstance(item, str)
-            ][-MAX_SEEN_ARTICLES:]
-    except (OSError, json.JSONDecodeError) as exc:
-        log.error("Cannot read article history: %s", exc)
-        raise RuntimeError(
-            "Article history is unavailable; stopping to avoid reposts."
-        ) from exc
+            return data
+    except (OSError, json.JSONDecodeError):
+        logging.exception("Could not read article history.")
 
-    raise RuntimeError("Article history has an invalid format.")
+    return []
 
 
-def save_seen_articles(links):
-    """Save article history for the next scheduled run."""
+def save_history(history):
     STATE_FILE.write_text(
-        json.dumps(links[-MAX_SEEN_ARTICLES:], indent=2),
+        json.dumps(history[-2000:], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
 
-def get_entry_date(entry):
-    """Return a comparable publication timestamp."""
+def extract_image(entry):
+    """Return a feed-provided image URL, if available."""
+    candidates = []
+
+    for item in entry.get("media_content", []) or []:
+        if item.get("url"):
+            candidates.append(item["url"])
+
+    for item in entry.get("media_thumbnail", []) or []:
+        if item.get("url"):
+            candidates.append(item["url"])
+
+    for item in entry.get("enclosures", []) or []:
+        url = item.get("href") or item.get("url")
+        media_type = item.get("type", "")
+        if url and media_type.startswith("image/"):
+            candidates.append(url)
+
+    image = entry.get("image")
+    if isinstance(image, dict) and image.get("href"):
+        candidates.append(image["href"])
+
+    for url in candidates:
+        if isinstance(url, str) and url.startswith("https://"):
+            return url
+
+    return None
+
+
+def make_ai_summary(title, description, source):
+    """Use Groq to summarize supplied reporting, not invent facts."""
+    keys = groq_keys()
+    if not keys:
+        return None
+
+    prompt = f"""
+You are the editor of TREQUARTISTA, a professional football
+intelligence publication.
+
+Rewrite the supplied football news as a concise English summary.
+Use only facts contained in the supplied text. Do not add outside
+facts, scores, quotes, transfer claims, or speculation.
+Do not claim to have independently verified the story.
+Use 2 or 3 short sentences, ideally under 400 characters.
+Return only the summary, with no heading or bullet points.
+
+Publisher: {source}
+Headline: {title}
+Article description:
+{description[:5000]}
+"""
+
+    for key in keys:
+        try:
+            response = session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a careful football news editor. "
+                                "Never invent information."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 180,
+                },
+                timeout=25,
+            )
+
+            if response.status_code in (401, 403, 429):
+                logging.warning(
+                    "Groq key unavailable or rate-limited (%s).",
+                    response.status_code,
+                )
+                continue
+
+            response.raise_for_status()
+            result = response.json()["choices"][0]["message"]["content"]
+            result = clean_text(result)
+
+            if result:
+                return result[:MAX_SUMMARY_CHARS]
+
+        except requests.RequestException:
+            logging.warning("Groq request failed; trying another key.")
+        except (KeyError, IndexError, ValueError):
+            logging.warning("Groq returned an unexpected response.")
+
+    return None
+
+
+def get_date(entry):
     parsed = entry.get("published_parsed") or entry.get("updated_parsed")
-
     if parsed:
-        return time.mktime(parsed)
+        return time.strftime("%Y-%m-%d %H:%M", parsed)
+    return ""
 
-    return 0
-
-
-# --------------------------------------------------
-# RSS COLLECTION
-# --------------------------------------------------
 
 def collect_articles(seen):
-    """Fetch available RSS feeds and find new articles."""
     articles = []
-    seen_set = set(seen)
 
-    for source, feed_url in RSS_FEEDS.items():
+    for source, feed_url in RSS_FEEDS:
         try:
-            log.info("Checking %s", source)
-
-            response = requests.get(
-                feed_url,
-                headers=HEADERS,
-                timeout=REQUEST_TIMEOUT,
-            )
+            response = session.get(feed_url, timeout=20)
             response.raise_for_status()
-
             feed = feedparser.parse(response.content)
-
-            if feed.bozo and not feed.entries:
-                log.warning("%s returned an unreadable feed", source)
-                continue
 
             for entry in feed.entries:
                 title = clean_text(entry.get("title", ""))
-                link = normalize_url(entry.get("link", ""))
-
-                if not title or not link or link in seen_set:
-                    continue
-
-                summary = clean_text(
+                url = normalize_url(entry.get("link", ""))
+                description = clean_text(
                     entry.get("summary", "")
                     or entry.get("description", "")
                 )
 
+                if not title or not url or url in seen:
+                    continue
+
                 articles.append({
                     "source": source,
                     "title": title,
-                    "link": link,
-                    "summary": summary[:500],
-                    "published": get_entry_date(entry),
+                    "url": url,
+                    "description": description,
+                    "image": extract_image(entry),
+                    "date": get_date(entry),
                 })
 
-        except requests.RequestException as exc:
-            log.warning("Could not fetch %s: %s", source, exc)
         except Exception:
-            log.exception("Unexpected error reading %s", source)
+            logging.exception("Could not read feed: %s", source)
 
-    # Newest first; retain stable ordering for undated entries.
     articles.sort(
-        key=lambda item: item["published"],
+        key=lambda article: article["date"],
         reverse=True,
     )
-
-    # Deduplicate articles across feeds by normalized URL.
-    unique = []
-    local_seen = set(seen_set)
-
-    for article in articles:
-        if article["link"] not in local_seen:
-            unique.append(article)
-            local_seen.add(article["link"])
-
-    return unique
+    return articles
 
 
-# --------------------------------------------------
-# TELEGRAM PUBLISHING
-# --------------------------------------------------
+def telegram_request(method, payload, files=None):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
-def format_post(article):
-    """Build a readable Telegram post using the source's title."""
+    for attempt in range(3):
+        try:
+            response = session.post(
+                url,
+                data=payload,
+                files=files,
+                timeout=35,
+            )
+
+            if response.status_code == 429 and attempt < 2:
+                try:
+                    delay = response.json().get(
+                        "parameters", {}
+                    ).get("retry_after", 3)
+                except ValueError:
+                    delay = 3
+                time.sleep(min(int(delay), 20))
+                continue
+
+            response.raise_for_status()
+            result = response.json()
+
+            if not result.get("ok"):
+                raise RuntimeError(
+                    "Telegram rejected the message."
+                )
+
+            return result
+
+        except requests.RequestException:
+            if attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
+
+    raise RuntimeError("Telegram request failed.")
+
+
+def publish_article(article):
     title = article["title"]
-    summary = article["summary"]
+    source = article["source"]
+    description = article["description"]
 
-    # Keep posts concise and avoid duplicating the title.
-    if summary.lower().strip() == title.lower().strip():
-        summary = ""
+    summary = make_ai_summary(title, description, source)
 
-    lines = [
-        "⚽ TREQUARTISTA",
-        "",
-        title,
-    ]
+    if not summary:
+        summary = description[:MAX_SUMMARY_CHARS].strip()
 
-    if summary:
-        lines.extend(["", summary])
+    if not summary:
+        summary = "Read the latest football report from this publisher."
 
-    lines.extend([
-        "",
-        f"📰 Source: {article['source']}",
-        f"🔗 Read more: {article['link']}",
-        "",
-        "BETWEEN THE LINES.",
-    ])
-
-    return "\n".join(lines)
-
-
-def publish_to_telegram(message):
-    """Publish a post and confirm Telegram accepted it."""
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured.")
-
-    if not CHANNEL_ID:
-        raise RuntimeError("TELEGRAM_CHANNEL_ID is not configured.")
-
-    endpoint = (
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    caption = (
+        "⚽ TREQUARTISTA\n\n"
+        f"<b>{html.escape(title)}</b>\n\n"
+        f"{html.escape(summary)}\n\n"
+        f"📰 Source: {html.escape(source)}\n\n"
+        "<i>BETWEEN THE LINES.</i>"
     )
 
-    response = requests.post(
-        endpoint,
-        json={
-            "chat_id": CHANNEL_ID,
-            "text": message,
-            "disable_web_page_preview": False,
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(
-            "Telegram did not confirm the message was published."
+    # Telegram photo captions have a 1024-character limit.
+    if len(caption) > 1000:
+        summary = summary[:max(100, 1000 - len(title) - 150)].rstrip()
+        caption = (
+            "⚽ TREQUARTISTA\n\n"
+            f"<b>{html.escape(title[:220])}</b>\n\n"
+            f"{html.escape(summary)}\n\n"
+            f"📰 Source: {html.escape(source)}\n\n"
+            "<i>BETWEEN THE LINES.</i>"
         )
 
-    log.info("Telegram accepted the post.")
-    return result["result"]["message_id"]
+    image_url = article.get("image")
 
+    if image_url:
+        try:
+            image_response = session.get(
+                image_url,
+                timeout=20,
+                stream=True,
+            )
+            image_response.raise_for_status()
 
-# --------------------------------------------------
-# MAIN PIPELINE
-# --------------------------------------------------
+            content_type = image_response.headers.get(
+                "Content-Type", ""
+            ).lower()
+
+            if not content_type.startswith("image/"):
+                raise ValueError("Feed image URL did not return an image.")
+
+            image_bytes = image_response.content
+            image_response.close()
+
+            if len(image_bytes) > 9 * 1024 * 1024:
+                raise ValueError("Image exceeds Telegram upload limit.")
+
+            telegram_request(
+                "sendPhoto",
+                {
+                    "chat_id": CHANNEL_ID,
+                    "photo": "article.jpg",
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                },
+                files={
+                    "photo": (
+                        "article.jpg",
+                        image_bytes,
+                        content_type,
+                    )
+                },
+            )
+            logging.info("Published image post: %s", title)
+            return
+
+        except Exception:
+            logging.warning(
+                "Image unavailable; publishing text instead: %s",
+                title,
+            )
+
+    telegram_request(
+        "sendMessage",
+        {
+            "chat_id": CHANNEL_ID,
+            "text": caption,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        },
+    )
+    logging.info("Published text post: %s", title)
+
 
 def main():
-    log.info("TREQUARTISTA news collector starting.")
-
-    seen = load_seen_articles()
+    history = load_history()
+    seen = set(history)
     articles = collect_articles(seen)
 
     if not articles:
-        log.info("No new articles found.")
+        logging.info("No new articles found.")
+        save_history(history)
         return
 
-    # Save each successful post immediately so a later failure
-    # does not cause that same article to be posted again.
-    processed = list(seen)
-    published_count = 0
+    published = 0
 
-    for article in articles[:MAX_POSTS_PER_RUN]:
+    for article in articles:
+        if published >= MAX_POSTS_PER_RUN:
+            break
+
         try:
-            message = format_post(article)
-            message_id = publish_to_telegram(message)
+            publish_article(article)
 
-            processed.append(article["link"])
-            save_seen_articles(processed)
-            published_count += 1
+            # Mark as seen only after Telegram confirms publishing.
+            seen.add(article["url"])
+            history.append(article["url"])
+            published += 1
 
-            log.info(
-                "Published article %s (Telegram message %s)",
+        except Exception:
+            logging.exception(
+                "Could not publish article: %s",
                 article["title"],
-                message_id,
             )
 
-        except Exception as exc:
-            log.error(
-                "Publishing failed for '%s': %s",
-                article["title"],
-                exc,
-            )
-            save_seen_articles(processed)
-            raise
-
-    save_seen_articles(processed)
-
-    log.info(
-        "Finished. Published %s article(s).",
-        published_count,
-    )
+    save_history(history)
+    logging.info("Published %d new article(s).", published)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        log.exception("TREQUARTISTA run failed.")
-        sys.exit(1)
+    main()
