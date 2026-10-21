@@ -188,7 +188,19 @@ def extract_image(entry):
                 if match:
                     candidates.append(match.group(1))
 
-    for candidate in candidates:
+    # Prefer URLs found in embedded article HTML over generic RSS thumbnails.
+    embedded = []
+    for html_text in parts:
+        for tag in re.findall(r"<img\\b[^>]*>", html_text, re.I):
+            for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+                match = re.search(
+                    attr + r"\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]",
+                    tag, re.I
+                )
+                if match:
+                    embedded.append(match.group(1))
+
+    for candidate in embedded + candidates:
         if not isinstance(candidate, str):
             continue
         url = urljoin(entry.get("link", ""), unescape(candidate.strip()))
