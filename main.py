@@ -560,7 +560,6 @@ def publish_article(article):
                 "sendPhoto",
                 {
                     "chat_id": CHANNEL_ID,
-                    "photo": "article.jpg",
                     "caption": caption,
                     "parse_mode": "HTML",
                 },
