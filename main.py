@@ -439,12 +439,18 @@ def telegram_request(method, payload, files=None):
                 time.sleep(min(int(delay), 20))
                 continue
 
-            response.raise_for_status()
-            result = response.json()
+            try:
+                result = response.json()
+            except ValueError:
+                result = {}
 
-            if not result.get("ok"):
+            if not response.ok or not result.get("ok"):
+                description = result.get(
+                    "description", response.text[:500]
+                )
                 raise RuntimeError(
-                    "Telegram rejected the request."
+                    f"Telegram API error {response.status_code}: "
+                    f"{description}"
                 )
 
             return result
