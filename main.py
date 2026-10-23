@@ -146,71 +146,37 @@ def save_history(history):
 # ============================================================
 
 def extract_image(entry):
-    """Find images in RSS metadata and embedded HTML."""
-    from html import unescape
-    from urllib.parse import urljoin
-
     candidates = []
-    for field in ("media_content", "media_thumbnail", "enclosures"):
-        for item in entry.get(field, []) or []:
-            if not isinstance(item, dict):
+    def add(url, width=0, height=0, priority=0):
+        if isinstance(url, str) and url.strip().startswith(("https://", "http://")):
+            candidates.append((int(width or 0)*int(height or 0), priority, url.strip()))
+    for item in getattr(entry, "media_content", []) or []:
+        add(item.get("url"), item.get("width"), item.get("height"), 5)
+    for item in getattr(entry, "media_thumbnail", []) or []:
+        add(item.get("url"), item.get("width"), item.get("height"), 1)
+    for item in getattr(entry, "enclosures", []) or []:
+        if "image" in str(item.get("type", "")).lower():
+            add(item.get("href", item.get("url")), item.get("width"), item.get("height"), 4)
+    image = getattr(entry, "image", None)
+    if image:
+        add(image.get("href", image.get("url")), priority=3)
+    for field in ("content", "summary", "description", "summary_detail"):
+        value = getattr(entry, field, "")
+        values = [x.get("value", "") for x in value] if isinstance(value, list) else [value.get("value", "") if isinstance(value, dict) else value]
+        for text in values:
+            if not isinstance(text, str):
                 continue
-            url = item.get("url") or item.get("href")
-            kind = item.get("type", "")
-            if url and (
-                field != "enclosures"
-                or kind.startswith("image/")
-                or re.search(r"\.(jpg|jpeg|png|webp|gif)(?:[?#]|$)", url, re.I)
-            ):
-                candidates.append(url)
-
-    image = entry.get("image")
-    if isinstance(image, dict):
-        candidates.extend([image.get("href"), image.get("url")])
-
-    parts = []
-    for item in entry.get("content", []) or []:
-        if isinstance(item, dict):
-            parts.append(item.get("value", ""))
-    for field in ("summary", "description", "summary_detail"):
-        value = entry.get(field, "")
-        if isinstance(value, dict):
-            value = value.get("value", "")
-        if isinstance(value, str):
-            parts.append(value)
-
-    for html_text in parts:
-        for tag in re.findall(r"<img\b[^>]*>", html_text, re.I):
-            for attr in ("src", "data-src", "data-original", "data-lazy-src"):
-                match = re.search(
-                    attr + r"\s*=\s*['\"]([^'\"]+)['\"]", tag, re.I
-                )
+            for tag in re.findall("<img[^>]*>", text, re.I):
+                match = re.search(r"src=[\"\x27]([^\"\x27]+)", tag, re.I)
                 if match:
-                    candidates.append(match.group(1))
-
-    # Prefer URLs found in embedded article HTML over generic RSS thumbnails.
-    embedded = []
-    for html_text in parts:
-        for tag in re.findall(r"<img\\b[^>]*>", html_text, re.I):
-            for attr in ("src", "data-src", "data-original", "data-lazy-src"):
-                match = re.search(
-                    attr + r"\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]",
-                    tag, re.I
-                )
-                if match:
-                    embedded.append(match.group(1))
-
-    for candidate in embedded + candidates:
-        if not isinstance(candidate, str):
-            continue
-        url = urljoin(entry.get("link", ""), unescape(candidate.strip()))
-        if url.startswith("https://"):
+                    w = re.search(r"width=[\"\x27](\d+)", tag, re.I)
+                    h = re.search(r"height=[\"\x27](\d+)", tag, re.I)
+                    add(match.group(1), int(w.group(1)) if w else 0, int(h.group(1)) if h else 0, 3)
+    candidates.sort(reverse=True)
+    for pixels, priority, url in candidates:
+        if pixels == 0 or pixels >= 60000:
             return url
     return None
-
-
-# GROQ AI SUMMARIZATION WITH ALL MODEL FALLBACKS
-# ============================================================
 
 def make_ai_summary(title, description, source):
     """
