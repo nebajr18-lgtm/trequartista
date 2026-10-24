@@ -42,14 +42,51 @@ GROQ_FALLBACK_MODELS = [
 ]
 
 RSS_FEEDS = [
-    (
-        "BBC Sport",
-        "https://feeds.bbci.co.uk/sport/football/rss.xml",
-    ),
-    (
-        "The Guardian",
-        "https://www.theguardian.com/football/rss",
-    ),
+    ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml"),
+    ("The Guardian", "https://www.theguardian.com/football/rss"),
+    ("Sky Sports", "https://www.skysports.com/rss/11095"),
+    ("The Athletic", "https://www.nytimes.com/athletic/rss/news/"),
+    ("ESPN Soccer", "https://news.google.com/rss/search?q=site%3Aespn.com%2Fsoccer&hl=en-US&gl=US&ceid=US:en"),
+    ("L'Équipe Football", "https://dwh.lequipe.fr/api/edito/rss?path=/Football/"),
+]
+
+# Full source registry. Registration does not imply live API access.
+# Sources marked "needs_api_or_approved_feed" require a verified,
+# permitted connection before they can be used for automatic collection.
+SOURCE_REGISTRY = [
+    {"name": "Premier League", "type": "official_competition", "access": "needs_api_or_approved_feed"},
+    {"name": "LaLiga", "type": "official_competition", "access": "needs_api_or_approved_feed"},
+    {"name": "Serie A", "type": "official_competition", "access": "needs_api_or_approved_feed"},
+    {"name": "Bundesliga", "type": "official_competition", "access": "needs_api_or_approved_feed"},
+    {"name": "Ligue 1", "type": "official_competition", "access": "needs_api_or_approved_feed"},
+    {"name": "UEFA", "type": "official_competition", "access": "needs_api_or_approved_feed"},
+    {"name": "FIFA", "type": "official_competition", "access": "needs_api_or_approved_feed"},
+    {"name": "BBC Sport", "type": "news_rss", "access": "active_rss"},
+    {"name": "Sky Sports", "type": "news_rss", "access": "active_rss"},
+    {"name": "ESPN", "type": "news_rss_bridge", "access": "active_rss_bridge"},
+    {"name": "The Athletic", "type": "news_rss", "access": "active_rss"},
+    {"name": "Reuters", "type": "news", "access": "needs_api_or_approved_feed"},
+    {"name": "The Guardian", "type": "news_rss", "access": "active_rss"},
+    {"name": "AP Sports", "type": "news", "access": "needs_api_or_approved_feed"},
+    {"name": "GOAL", "type": "news", "access": "needs_verified_feed"},
+    {"name": "FourFourTwo", "type": "news", "access": "needs_verified_feed"},
+    {"name": "90min", "type": "news", "access": "needs_verified_feed"},
+    {"name": "Fabrizio Romano", "type": "transfer_reporter", "access": "needs_approved_feed"},
+    {"name": "Gianluca Di Marzio", "type": "transfer_reporter", "access": "needs_verified_feed"},
+    {"name": "MARCA", "type": "news", "access": "needs_verified_feed"},
+    {"name": "AS", "type": "news", "access": "needs_verified_feed"},
+    {"name": "Mundo Deportivo", "type": "news", "access": "needs_verified_feed"},
+    {"name": "La Gazzetta dello Sport", "type": "news", "access": "needs_verified_feed"},
+    {"name": "kicker", "type": "news", "access": "needs_verified_feed"},
+    {"name": "L'Équipe", "type": "news_rss", "access": "active_rss"},
+    {"name": "Transfermarkt", "type": "transfer_data", "access": "needs_approved_data_access"},
+    {"name": "FBref", "type": "statistics", "access": "needs_permitted_data_access"},
+    {"name": "Sofascore", "type": "live_scores_statistics", "access": "needs_api_or_approved_feed"},
+    {"name": "FotMob", "type": "live_scores_statistics", "access": "needs_api_or_approved_feed"},
+    {"name": "Understat", "type": "expected_goals_statistics", "access": "needs_permitted_data_access"},
+    {"name": "11v11", "type": "historical_statistics", "access": "needs_permitted_data_access"},
+    {"name": "RSSSF", "type": "historical_statistics", "access": "needs_permitted_data_access"},
+    {"name": "WorldFootball.net", "type": "historical_statistics", "access": "needs_permitted_data_access"},
 ]
 
 session = requests.Session()
@@ -567,11 +604,126 @@ def publish_article(article):
     )
 
 
+
+# FOOTBALL DATA API INTEGRATION
+API_STATE_FILE = Path("seen_football_events.json")
+
+def api_get(url, token, headers=None, params=None):
+    try:
+        h = dict(headers or {})
+        if token and not h:
+            h["Authorization"] = token
+        r = session.get(url, headers=h, params=params or {}, timeout=20)
+        if r.status_code in (401, 403, 429):
+            logging.warning("Football API returned HTTP %s for %s", r.status_code, url.split("?")[0])
+            return {}
+        r.raise_for_status()
+        return r.json()
+    except (requests.RequestException, ValueError):
+        logging.warning("Football API request failed: %s", url.split("?")[0])
+        return {}
+
+def run_football_apis():
+    try:
+        history = json.loads(API_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(history, dict): history = {}
+    except (OSError, ValueError):
+        history = {}
+    items = []
+
+    # Sportmonks: in-play fixtures, scores and events.
+    token = os.environ.get("SPORTMONKS_API_TOKEN", "").strip()
+    if token:
+        data = api_get("https://api.sportmonks.com/v3/football/livescores/inplay", token,
+                       params={"include": "participants;scores;events;state;league;xGFixture"})
+        for f in data.get("data", []) if isinstance(data.get("data", []), list) else []:
+            teams = f.get("participants") or []
+            home, away = "Home", "Away"
+            for team in teams:
+                loc = str((team.get("meta") or {}).get("location", "")).lower()
+                if loc == "home": home = team.get("name", home)
+                elif loc == "away": away = team.get("name", away)
+            state = (f.get("state") or {}).get("name", "In play")
+            score_bits = []
+            for sc in f.get("scores") or []:
+                if isinstance(sc.get("score"), dict):
+                    score_bits.append(str(sc["score"].get("goals", "")))
+            score = " - ".join(score_bits[:2]) if score_bits else "score pending"
+            ev = []
+            for e in (f.get("events") or [])[-6:]:
+                typ = (e.get("type") or {}).get("name", "Event")
+                minute = e.get("minute")
+                player = e.get("player_name", "")
+                ev.append(f"{minute or ''}' {typ}" + (f": {player}" if player else ""))
+            xg = f.get("xGFixture")
+            body = f"Status: {state}. Score: {score}."
+            if ev: body += "\n" + "\n".join(ev)
+            if xg: body += "\nExpected-goals data supplied by Sportmonks."
+            items.append((f"sm:{f.get('id')}", f"🔴 LIVE | {home} vs {away}", body, "Sportmonks"))
+
+    # API-Football: live scores plus recent event changes.
+    key = os.environ.get("API_FOOTBALL_KEY", "").strip()
+    if key:
+        headers = {"x-apisports-key": key}
+        data = api_get("https://v3.football.api-sports.io/fixtures", "", headers=headers, params={"live": "all"})
+        for f in data.get("response", []) if isinstance(data.get("response", []), list) else []:
+            fx, teams, goals = f.get("fixture") or {}, f.get("teams") or {}, f.get("goals") or {}
+            mid = fx.get("id")
+            home = (teams.get("home") or {}).get("name", "Home")
+            away = (teams.get("away") or {}).get("name", "Away")
+            minute = (fx.get("status") or {}).get("elapsed")
+            title = f"🔴 LIVE | {home} {goals.get('home', '?')}-{goals.get('away', '?')} {away}"
+            if minute is not None: title += f" ({minute}')"
+            ed = api_get("https://v3.football.api-sports.io/fixtures/events", "", headers=headers, params={"fixture": mid})
+            ev = []
+            for e in (ed.get("response") or [])[-6:]:
+                tm = e.get("time") or {}
+                player = (e.get("player") or {}).get("name", "")
+                ev.append(f"{tm.get('elapsed', '')}' {e.get('detail', 'Event')}" + (f": {player}" if player else ""))
+            items.append((f"af:{mid}", title, "\n".join(ev) or "Live score from API-Football.", "API-Football"))
+
+    # football-data.org: recent finished matches and supported live statuses.
+    token = os.environ.get("FOOTBALL_DATA_TOKEN", "").strip()
+    if token:
+        from datetime import datetime, timedelta, timezone
+        today = datetime.now(timezone.utc).date()
+        data = api_get("https://api.football-data.org/v4/matches", "", headers={"X-Auth-Token": token},
+                       params={"dateFrom": (today-timedelta(days=2)).isoformat(), "dateTo": today.isoformat()})
+        for m in data.get("matches", []) if isinstance(data.get("matches", []), list) else []:
+            status = m.get("status", "")
+            if status not in ("FINISHED", "IN_PLAY", "PAUSED", "LIVE"): continue
+            score = (m.get("score") or {}).get("fullTime") or {}
+            h = (m.get("homeTeam") or {}).get("name", "Home")
+            a = (m.get("awayTeam") or {}).get("name", "Away")
+            title = f"{'🔴 LIVE | ' if status in ('IN_PLAY','PAUSED','LIVE') else ''}{h} {score.get('home','?')}-{score.get('away','?')} {a}"
+            items.append((f"fd:{m.get('id')}:{status}:{score.get('home')}:{score.get('away')}", title,
+                          f"Status: {status.replace('_',' ').title()}.", "football-data.org"))
+
+    for ident, title, body, source in items:
+        fingerprint = re.sub(r"\s+", " ", title + " " + body).strip()
+        if history.get(ident) == fingerprint: continue
+        caption = ("⚽ TREQUARTISTA | FOOTBALL INTELLIGENCE\n\n<b>" + html.escape(title) +
+                   "</b>\n\n" + html.escape(body[:2200]) + "\n\n📊 Data: " +
+                   html.escape(source) + "\n<i>BETWEEN THE LINES.</i>")
+        try:
+            telegram_request("sendMessage", {"chat_id": CHANNEL_ID, "text": caption[:3900],
+                                             "parse_mode": "HTML", "disable_web_page_preview": "true"})
+            history[ident] = fingerprint
+        except Exception:
+            logging.exception("Could not publish football API update.")
+    if len(history) > 3000: history = dict(list(history.items())[-2500:])
+    API_STATE_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
+    try:
+        run_football_apis()
+    except Exception:
+        logging.exception("Football API integration failed; continuing news collection.")
     history = load_history()
     seen = set(history)
 
