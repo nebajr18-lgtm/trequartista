@@ -21,7 +21,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-BOT_TOKEN = 8805548182:AAG4JpSrVSIXNqq_F7zdZRT34kRESro3Qpw
+BOT_TOKEN = "8805548182:AAG4JpSrVSIXNqq_F7zdZRT34kRESro3Qpw"
 CHANNEL_ID = os.environ.get(
     "TELEGRAM_CHANNEL_ID",
     "@Trequartista_official",
