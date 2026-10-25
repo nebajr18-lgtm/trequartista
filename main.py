@@ -45,7 +45,6 @@ RSS_FEEDS = [
     ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml"),
     ("The Guardian", "https://www.theguardian.com/football/rss"),
     ("Sky Sports", "https://www.skysports.com/rss/11095"),
-    ("The Athletic", "https://www.nytimes.com/athletic/rss/news/"),
     ("ESPN Soccer", "https://news.google.com/rss/search?q=site%3Aespn.com%2Fsoccer&hl=en-US&gl=US&ceid=US:en"),
     ("L'Équipe Football", "https://dwh.lequipe.fr/api/edito/rss?path=/Football/"),
 ]
@@ -64,7 +63,7 @@ SOURCE_REGISTRY = [
     {"name": "BBC Sport", "type": "news_rss", "access": "active_rss"},
     {"name": "Sky Sports", "type": "news_rss", "access": "active_rss"},
     {"name": "ESPN", "type": "news_rss_bridge", "access": "active_rss_bridge"},
-    {"name": "The Athletic", "type": "news_rss", "access": "active_rss"},
+    {"name": "The Athletic", "type": "news_rss", "access": "inactive"},
     {"name": "Reuters", "type": "news", "access": "needs_api_or_approved_feed"},
     {"name": "The Guardian", "type": "news_rss", "access": "active_rss"},
     {"name": "AP Sports", "type": "news", "access": "needs_api_or_approved_feed"},
@@ -383,6 +382,17 @@ def get_date(entry):
     return ""
 
 
+def is_football_article(title, description=""):
+    text = (title + " " + description).casefold()
+    nonfootball = [
+        "nba ", "mlb ", "world series", "formula 1", "formula one",
+        "f1 academy", "nfl ", "nfl:", "college football",
+        "american football", "cricket", "rugby", "tennis",
+        "basketball", "baseball", "ice hockey", "golf tournament"
+    ]
+    return not any(term in text for term in nonfootball)
+
+
 def collect_articles(seen):
     """Collect articles while suppressing duplicate URLs and headlines."""
     articles = []
@@ -404,6 +414,10 @@ def collect_articles(seen):
                     entry.get("summary", "") or entry.get("description", "")
                 )
                 key = title_key(title)
+
+                if not is_football_article(title, description):
+                    logging.info("Skipped non-football article: %s", title)
+                    continue
 
                 if not title or not url or url in seen or not key:
                     continue
@@ -636,7 +650,17 @@ def run_football_apis():
     if token:
         data = api_get("https://api.sportmonks.com/v3/football/livescores/inplay", token,
                        params={"include": "participants;scores;events;state;league;xGFixture"})
+        major_league_names = (
+            "premier league", "la liga", "serie a", "bundesliga", "ligue 1",
+            "champions league", "europa league", "conference league",
+            "world cup", "european championship", "copa america",
+            "mls", "eredivisie", "primeira liga", "fa cup", "copa del rey"
+        )
         for f in data.get("data", []) if isinstance(data.get("data", []), list) else []:
+            league = f.get("league") or {}
+            league_name = str(league.get("name", "")).casefold()
+            if not any(name in league_name for name in major_league_names):
+                continue
             teams = f.get("participants") or []
             home, away = "Home", "Away"
             for team in teams:
@@ -666,7 +690,14 @@ def run_football_apis():
     if key:
         headers = {"x-apisports-key": key}
         data = api_get("https://v3.football.api-sports.io/fixtures", "", headers=headers, params={"live": "all"})
+        major_leagues = {
+            2, 3, 848, 1, 4, 9, 39, 140, 135, 78, 61,
+            45, 143, 88, 94, 253, 71, 128, 262, 307
+        }
         for f in data.get("response", []) if isinstance(data.get("response", []), list) else []:
+            league = f.get("league") or {}
+            if league.get("id") not in major_leagues:
+                continue
             fx, teams, goals = f.get("fixture") or {}, f.get("teams") or {}, f.get("goals") or {}
             mid = fx.get("id")
             home = (teams.get("home") or {}).get("name", "Home")
@@ -680,7 +711,7 @@ def run_football_apis():
                 tm = e.get("time") or {}
                 player = (e.get("player") or {}).get("name", "")
                 ev.append(f"{tm.get('elapsed', '')}' {e.get('detail', 'Event')}" + (f": {player}" if player else ""))
-            items.append((f"af:{mid}", title, "\n".join(ev) or "Live score from API-Football.", "API-Football"))
+            items.append((f"af:{mid}", title, "\n".join(ev) or "Score and match status update; no event details returned yet.", "API-Football"))
 
     # football-data.org: recent finished matches and supported live statuses.
     token = os.environ.get("FOOTBALL_DATA_TOKEN", "").strip()
